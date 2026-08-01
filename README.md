@@ -7,11 +7,23 @@ each file to embed its original relative path. Example:
 components/ble_service/include/ble_service.h
 ```
 
-becomes:
+becomes (default "slash-like" separator):
+
+```
+myproject∕components∕ble_service∕include∕ble_service.h
+```
+
+or, with the underscore separator:
 
 ```
 myproject_components_ble_service_include_ble_service.h
 ```
+
+Windows and Linux both forbid a literal `/` or `\` inside a filename (they're
+path separators), so the default separator uses `∕` (U+2215 DIVISION SLASH)
+— a Unicode character that looks like a forward slash but is legal in a
+filename. You can also switch to a plain underscore or type any custom
+separator string in the GUI.
 
 Source files are never modified, moved, or deleted — this only copies.
 Re-running is safe; the output folder is automatically excluded from the
