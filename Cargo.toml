@@ -7,7 +7,7 @@ edition = "2024"
 eframe = "0.35"
 egui = "0.35"
 rfd = "0.17.2"
-walkdir = "2.5"
+ignore = "0.4.21"
  
 [dev-dependencies]
 tempfile = "3"

@@ -123,6 +123,7 @@ struct FlattenizerApp {
     ignored_folders_text: String,
     ignored_files_text: String,
     ignored_extensions_text: String,
+    respect_gitignore: bool,
     separator_choice: SeparatorChoice,
     custom_separator: String,
     status: String,
@@ -136,9 +137,10 @@ impl Default for FlattenizerApp {
             output_folder_name: "flattened".to_string(),
             root_name_choice: RootNameChoice::FolderName,
             custom_root_name: String::new(),
-            ignored_folders_text: "node_modules, .git, target, build, .venv".to_string(),
-            ignored_files_text: ".DS_Store, Thumbs.db".to_string(),
+            ignored_folders_text: "node_modules, .git, target, build, managed_components, .venv, .vscode".to_string(),
+            ignored_files_text: ".DS_Store, Thumbs.db, dependencies.lock, partitions.csv".to_string(),
             ignored_extensions_text: "log, tmp".to_string(),
+            respect_gitignore: true,
             separator_choice: SeparatorChoice::SlashLike,
             custom_separator: String::new(),
             status: String::new(),
@@ -180,6 +182,7 @@ impl FlattenizerApp {
             ignored_file_names: parse_list(&self.ignored_files_text),
             ignored_extensions: parse_list(&self.ignored_extensions_text),
             separator_style,
+            respect_gitignore: self.respect_gitignore,
         })
     }
 }
@@ -230,7 +233,7 @@ impl eframe::App for FlattenizerApp {
             // --- Output settings ---
             card(ui, |ui| {
                 section_label(ui, "Output");
-                ui.label("Folder name (created inside the source folder):");
+                ui.label("Folder name (created inside the source folder). Re-running replaces this folder entirely:");
                 ui.text_edit_singleline(&mut self.output_folder_name);
 
                 ui.add_space(10.0);
@@ -301,6 +304,17 @@ impl eframe::App for FlattenizerApp {
             // --- Ignore rules ---
             card(ui, |ui| {
                 section_label(ui, "Ignore rules");
+
+                ui.checkbox(&mut self.respect_gitignore, "Respect .gitignore rules");
+                ui.label(
+                    egui::RichText::new(
+                        "Skips anything excluded by .gitignore, .git/info/exclude, and your global gitignore.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(10.0);
                 ui.label("Folders (comma-separated names):");
                 ui.text_edit_singleline(&mut self.ignored_folders_text);
 

@@ -1,7 +1,7 @@
+use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Preset separator styles for joining path segments into a flat filename.
 /// Windows forbids literal '/' and '\' in filenames, so `SlashLike` uses a
@@ -62,6 +62,9 @@ pub struct FlattenOptions {
     pub ignored_extensions: HashSet<String>,
     /// Separator used when joining path segments into the new filename.
     pub separator_style: SeparatorStyle,
+    /// If true, honor .gitignore files (and .git/info/exclude, global
+    /// gitignore) found in the source tree, skipping anything they exclude.
+    pub respect_gitignore: bool,
 }
 
 impl Default for FlattenOptions {
@@ -74,6 +77,7 @@ impl Default for FlattenOptions {
             ignored_file_names: HashSet::new(),
             ignored_extensions: HashSet::new(),
             separator_style: SeparatorStyle::SlashLike,
+            respect_gitignore: true,
         }
     }
 }
@@ -95,11 +99,6 @@ pub struct FlattenSummary {
 
 fn lower(s: &str) -> String {
     s.to_lowercase()
-}
-
-/// Returns true if a given path component (folder or file name) should be ignored.
-fn is_folder_ignored(name: &str, opts: &FlattenOptions) -> bool {
-    opts.ignored_folder_names.contains(&lower(name))
 }
 
 fn is_file_ignored(file_name: &str, opts: &FlattenOptions) -> bool {
@@ -149,24 +148,45 @@ pub fn plan(opts: &FlattenOptions) -> Result<Vec<PlannedRename>, String> {
 
     let mut planned = Vec::new();
 
-    let walker = WalkDir::new(&opts.source_dir).into_iter().filter_entry(|entry| {
-        // Never descend into the output folder itself (avoids feedback loops
-        // on repeated runs) or into ignored folders.
-        if entry.file_type().is_dir() {
-            let name = entry.file_name().to_string_lossy();
-            if entry.path() == output_dir {
-                return false;
+    let ignored_folder_names = opts.ignored_folder_names.clone();
+
+    let mut builder = WalkBuilder::new(&opts.source_dir);
+    builder
+        // Master switch: when false, disables every gitignore-family source
+        // (.gitignore, .git/info/exclude, and the user's global gitignore).
+        .git_ignore(opts.respect_gitignore)
+        .git_exclude(opts.respect_gitignore)
+        .git_global(opts.respect_gitignore)
+        // Honor .gitignore files even if the source folder isn't inside an
+        // actual git repository (no .git directory) — we just want the
+        // pattern matching, not git repo detection.
+        .require_git(false)
+        // We do our own explicit ignore-list filtering below; don't also
+        // apply .ignore files or hidden-file skipping implicitly.
+        .ignore(false)
+        .hidden(false)
+        .parents(opts.respect_gitignore)
+        .filter_entry(move |entry| {
+            // Never descend into the output folder itself (avoids feedback
+            // loops on repeated runs) or into ignored folders.
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                let name = lower(&entry.file_name().to_string_lossy());
+                if entry.path() == output_dir {
+                    return false;
+                }
+                if ignored_folder_names.contains(&name) {
+                    return false;
+                }
             }
-            if is_folder_ignored(&name, opts) {
-                return false;
-            }
-        }
-        true
-    });
+            true
+        });
+
+    let walker = builder.build();
 
     for entry in walker {
         let entry = entry.map_err(|e| format!("Walk error: {e}"))?;
-        if !entry.file_type().is_file() {
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
             continue;
         }
 
@@ -219,13 +239,20 @@ pub fn plan(opts: &FlattenOptions) -> Result<Vec<PlannedRename>, String> {
     Ok(planned)
 }
 
-/// Executes a flatten run: creates the output folder and copies every
-/// planned file into it under its new flattened name. Source files are
-/// never modified or deleted — this is a copy, not a move, so re-running
-/// is always safe.
+/// Executes a flatten run: wipes any existing output folder, recreates it,
+/// and copies every planned file into it under its new flattened name.
+/// Source files are never modified or deleted — this is a copy, not a
+/// move. Re-running always produces a clean result: the previous output
+/// folder's contents are fully replaced rather than merged with stale
+/// files from an earlier run (e.g. with different ignore rules).
 pub fn run(opts: &FlattenOptions) -> Result<FlattenSummary, String> {
     let planned = plan(opts)?;
     let output_dir = opts.source_dir.join(opts.output_folder_name.trim());
+
+    if output_dir.is_dir() {
+        fs::remove_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to clear existing output folder: {e}"))?;
+    }
 
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("Failed to create output folder: {e}"))?;
@@ -269,6 +296,55 @@ mod tests {
         fs::write(root.join("readme.md"), "content").unwrap();
         fs::write(root.join("debug.log"), "content").unwrap();
         dir
+    }
+
+    #[test]
+    fn gitignore_rules_are_respected_by_default() {
+        let dir = make_test_tree();
+        fs::write(
+            dir.path().join(".gitignore"),
+            "debug.log\nnode_modules/\n",
+        )
+        .unwrap();
+
+        let opts = FlattenOptions {
+            source_dir: dir.path().to_path_buf(),
+            root_name_mode: RootNameMode::None,
+            separator_style: SeparatorStyle::Underscore,
+            ..Default::default() // respect_gitignore: true
+        };
+        let planned = plan(&opts).unwrap();
+        let names: Vec<String> = planned.iter().map(|p| p.new_file_name.clone()).collect();
+
+        assert!(names.contains(&"readme.md".to_string()));
+        assert!(!names.iter().any(|n| n.contains("debug.log")));
+        assert!(!names.iter().any(|n| n.contains("node_modules")));
+        // The .gitignore file itself shouldn't be swept up as a "content" file
+        // by mistake (it's not excluded by its own rules, but confirm it's
+        // present as ordinary content since we didn't ignore dotfiles).
+    }
+
+    #[test]
+    fn gitignore_can_be_disabled() {
+        let dir = make_test_tree();
+        fs::write(dir.path().join(".gitignore"), "debug.log\n").unwrap();
+
+        let opts = FlattenOptions {
+            source_dir: dir.path().to_path_buf(),
+            root_name_mode: RootNameMode::None,
+            separator_style: SeparatorStyle::Underscore,
+            respect_gitignore: false,
+            ..Default::default()
+        };
+        let mut opts = opts;
+        opts.ignored_folder_names.insert("node_modules".to_string());
+
+        let planned = plan(&opts).unwrap();
+        let names: Vec<String> = planned.iter().map(|p| p.new_file_name.clone()).collect();
+
+        // debug.log would normally be gitignored, but with respect_gitignore
+        // false it should come through since it isn't in our manual ignore lists.
+        assert!(names.contains(&"debug.log".to_string()));
     }
 
     #[test]
@@ -338,6 +414,42 @@ mod tests {
         let names: Vec<String> = planned.iter().map(|p| p.new_file_name.clone()).collect();
         let expected = "components\u{2215}ble_service\u{2215}include\u{2215}ble_service.h";
         assert!(names.contains(&expected.to_string()), "names: {:?}", names);
+    }
+
+    #[test]
+    fn rerun_wipes_stale_output_from_previous_run() {
+        let dir = make_test_tree();
+
+        // First run: underscore separator, root name prefix included.
+        let opts_v1 = FlattenOptions {
+            source_dir: dir.path().to_path_buf(),
+            root_name_mode: RootNameMode::UseFolderName,
+            separator_style: SeparatorStyle::Underscore,
+            ..Default::default()
+        };
+        run(&opts_v1).unwrap();
+
+        let output_dir = dir.path().join("flattened");
+        let root_name = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        let stale_name = format!("{root_name}_readme.md");
+        assert!(output_dir.join(&stale_name).exists());
+
+        // Second run: no root name prefix, different separator. The old
+        // "<root>_readme.md" file must be gone, not just left alongside
+        // the newly-named output.
+        let opts_v2 = FlattenOptions {
+            source_dir: dir.path().to_path_buf(),
+            root_name_mode: RootNameMode::None,
+            separator_style: SeparatorStyle::Underscore,
+            ..Default::default()
+        };
+        run(&opts_v2).unwrap();
+
+        assert!(
+            !output_dir.join(&stale_name).exists(),
+            "stale file from previous run should have been wiped"
+        );
+        assert!(output_dir.join("readme.md").exists());
     }
 
     #[test]
