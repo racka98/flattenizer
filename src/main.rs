@@ -28,7 +28,7 @@ fn main() -> eframe::Result<()> {
 /// Applies a modern dark theme: custom accent color, generous rounding,
 /// roomier spacing, and a slightly larger base font.
 fn setup_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
 
     // Spacing: airier than egui's cramped defaults.
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
@@ -76,7 +76,8 @@ fn setup_style(ctx: &egui::Context) {
         egui::FontId::new(24.0, egui::FontFamily::Proportional),
     );
 
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_theme(egui::Theme::Dark);
 }
 
 /// Wraps content in a rounded, slightly raised "card" panel — the main
@@ -185,7 +186,13 @@ impl FlattenizerApp {
 
 impl eframe::App for FlattenizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("🐝").size(26.0));
@@ -326,8 +333,12 @@ impl eframe::App for FlattenizerApp {
                     }
                 }
 
-                let run_btn = egui::Button::new(egui::RichText::new("Run").strong())
+                let run_label = egui::RichText::new("Run")
+                    .strong()
+                    .color(egui::Color32::BLACK);
+                let run_btn = egui::Button::new(run_label)
                     .fill(egui::Color32::from_rgb(245, 166, 35))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 166, 35)))
                     .min_size(egui::vec2(90.0, 0.0));
                 if ui.add_enabled(can_run, run_btn).clicked() {
                     if let Some(opts) = self.build_options() {
@@ -372,6 +383,7 @@ impl eframe::App for FlattenizerApp {
             }
 
             ui.add_space(8.0);
-        });
+                    });
+            });
     }
 }
