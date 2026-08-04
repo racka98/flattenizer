@@ -1,4 +1,5 @@
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// Windows forbids literal '/' and '\' in filenames, so `SlashLike` uses a
 /// visually similar Unicode character (U+2215 DIVISION SLASH) that is legal
 /// in a filename on both Windows and Linux.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeparatorStyle {
     /// Plain underscore: `components_ble_service_include_ble_service.h`
     Underscore,
@@ -35,7 +36,7 @@ impl SeparatorStyle {
 }
 
 /// How to handle the root folder's own name when building the prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootNameMode {
     /// Don't include the root folder name at all.
     None,
@@ -82,7 +83,117 @@ impl Default for FlattenOptions {
     }
 }
 
-/// A single planned rename: original file path -> new flat file name.
+/// Filename for a per-folder config file, saved in the root of the folder
+/// being flattened. Distinct name so it's unambiguous if checked into git.
+pub const CONFIG_FILE_NAME: &str = ".flattenizerrc";
+
+/// The persistable subset of `FlattenOptions` — everything except
+/// `source_dir`, which is implicit (the config lives inside that folder).
+/// Serialized as JSON to `.flattenizerrc` in the root of the target folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    #[serde(default = "default_output_folder_name")]
+    pub output_folder_name: String,
+    #[serde(default = "default_root_name_mode")]
+    pub root_name_mode: RootNameMode,
+    #[serde(default)]
+    pub ignored_folder_names: HashSet<String>,
+    #[serde(default)]
+    pub ignored_file_names: HashSet<String>,
+    #[serde(default)]
+    pub ignored_extensions: HashSet<String>,
+    #[serde(default = "default_separator_style")]
+    pub separator_style: SeparatorStyle,
+    #[serde(default = "default_respect_gitignore")]
+    pub respect_gitignore: bool,
+}
+
+fn default_output_folder_name() -> String {
+    "flattened".to_string()
+}
+fn default_root_name_mode() -> RootNameMode {
+    RootNameMode::UseFolderName
+}
+fn default_separator_style() -> SeparatorStyle {
+    SeparatorStyle::SlashLike
+}
+fn default_respect_gitignore() -> bool {
+    true
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            output_folder_name: default_output_folder_name(),
+            root_name_mode: default_root_name_mode(),
+            ignored_folder_names: HashSet::new(),
+            ignored_file_names: HashSet::new(),
+            ignored_extensions: HashSet::new(),
+            separator_style: default_separator_style(),
+            respect_gitignore: default_respect_gitignore(),
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// Builds a config from a full `FlattenOptions`, dropping `source_dir`.
+    pub fn from_options(opts: &FlattenOptions) -> Self {
+        Self {
+            output_folder_name: opts.output_folder_name.clone(),
+            root_name_mode: opts.root_name_mode.clone(),
+            ignored_folder_names: opts.ignored_folder_names.clone(),
+            ignored_file_names: opts.ignored_file_names.clone(),
+            ignored_extensions: opts.ignored_extensions.clone(),
+            separator_style: opts.separator_style.clone(),
+            respect_gitignore: opts.respect_gitignore,
+        }
+    }
+
+    /// Applies this config onto a `FlattenOptions`, keeping `source_dir` as-is.
+    #[allow(dead_code)]
+    pub fn apply_to(&self, opts: &mut FlattenOptions) {
+        opts.output_folder_name = self.output_folder_name.clone();
+        opts.root_name_mode = self.root_name_mode.clone();
+        opts.ignored_folder_names = self.ignored_folder_names.clone();
+        opts.ignored_file_names = self.ignored_file_names.clone();
+        opts.ignored_extensions = self.ignored_extensions.clone();
+        opts.separator_style = self.separator_style.clone();
+        opts.respect_gitignore = self.respect_gitignore;
+    }
+}
+
+/// Path to the config file for a given source folder.
+pub fn config_path(source_dir: &Path) -> PathBuf {
+    source_dir.join(CONFIG_FILE_NAME)
+}
+
+/// Loads `.flattenizerrc` from the root of `source_dir`, if present.
+/// Returns `Ok(None)` if the file doesn't exist. A malformed file is
+/// reported as an `Err` rather than silently ignored, so the user finds
+/// out their config didn't load instead of quietly getting defaults.
+pub fn load_config(source_dir: &Path) -> Result<Option<ProjectConfig>, String> {
+    let path = config_path(source_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let config: ProjectConfig = serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    Ok(Some(config))
+}
+
+/// Saves the given config as `.flattenizerrc` in the root of `source_dir`,
+/// overwriting any existing file there.
+pub fn save_config(source_dir: &Path, config: &ProjectConfig) -> Result<(), String> {
+    let path = config_path(source_dir);
+    let text = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+
 #[derive(Debug, Clone)]
 pub struct PlannedRename {
     pub source_path: PathBuf,
@@ -197,6 +308,12 @@ pub fn plan(opts: &FlattenOptions) -> Result<Vec<PlannedRename>, String> {
             continue;
         }
 
+        // Skip our own config file at the source root — it's tool metadata,
+        // not project content, so it shouldn't end up in the flattened output.
+        if file_name == CONFIG_FILE_NAME && path.parent() == Some(opts.source_dir.as_path()) {
+            continue;
+        }
+
         let rel_path = path
             .strip_prefix(&opts.source_dir)
             .map_err(|e| format!("Path prefix error: {e}"))?;
@@ -296,6 +413,50 @@ mod tests {
         fs::write(root.join("readme.md"), "content").unwrap();
         fs::write(root.join("debug.log"), "content").unwrap();
         dir
+    }
+
+    #[test]
+    fn config_roundtrips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = ProjectConfig::default();
+        config.output_folder_name = "out".to_string();
+        config.root_name_mode = RootNameMode::Custom("hivetrace".to_string());
+        config.separator_style = SeparatorStyle::Underscore;
+        config.respect_gitignore = false;
+        config.ignored_folder_names.insert("build".to_string());
+
+        save_config(dir.path(), &config).unwrap();
+        assert!(config_path(dir.path()).is_file());
+
+        let loaded = load_config(dir.path()).unwrap().expect("config should load");
+        assert_eq!(loaded.output_folder_name, "out");
+        assert_eq!(loaded.root_name_mode, RootNameMode::Custom("hivetrace".to_string()));
+        assert_eq!(loaded.separator_style, SeparatorStyle::Underscore);
+        assert!(!loaded.respect_gitignore);
+        assert!(loaded.ignored_folder_names.contains("build"));
+    }
+
+    #[test]
+    fn load_config_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_config(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_file_is_excluded_from_flattened_output() {
+        let dir = make_test_tree();
+        save_config(dir.path(), &ProjectConfig::default()).unwrap();
+
+        let opts = FlattenOptions {
+            source_dir: dir.path().to_path_buf(),
+            root_name_mode: RootNameMode::None,
+            separator_style: SeparatorStyle::Underscore,
+            ..Default::default()
+        };
+        let planned = plan(&opts).unwrap();
+        let names: Vec<String> = planned.iter().map(|p| p.new_file_name.clone()).collect();
+        assert!(!names.iter().any(|n| n.contains(CONFIG_FILE_NAME)));
     }
 
     #[test]

@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod core;
+mod update;
 
 use crate::core::{FlattenOptions, RootNameMode, SeparatorStyle};
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -15,12 +17,21 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // Kick off the update check on a background thread so it never blocks
+    // GUI startup or interaction. Result comes back over a channel and is
+    // polled once per frame.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = update::check_for_update();
+        let _ = tx.send(result);
+    });
+
     eframe::run_native(
         "Flattenizer",
         native_options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(FlattenizerApp::default()))
+            Ok(Box::new(FlattenizerApp::new(rx)))
         }),
     )
 }
@@ -115,6 +126,15 @@ enum SeparatorChoice {
     Custom,
 }
 
+/// State of the background update check / installer download-and-launch flow.
+enum UpdateState {
+    Checking,
+    UpToDate,
+    Available(update::UpdateInfo),
+    Downloading,
+    Error(String),
+}
+
 struct FlattenizerApp {
     source_dir: Option<PathBuf>,
     output_folder_name: String,
@@ -128,23 +148,49 @@ struct FlattenizerApp {
     custom_separator: String,
     status: String,
     last_run_errors: Vec<String>,
+    config_status: Option<String>,
+    update_rx: Option<mpsc::Receiver<Result<Option<update::UpdateInfo>, String>>>,
+    update_state: UpdateState,
+    exit_tx: mpsc::Sender<()>,
+    exit_rx: mpsc::Receiver<()>,
 }
 
-impl Default for FlattenizerApp {
-    fn default() -> Self {
+impl FlattenizerApp {
+    fn new(update_rx: mpsc::Receiver<Result<Option<update::UpdateInfo>, String>>) -> Self {
+        let (exit_tx, exit_rx) = mpsc::channel();
         Self {
             source_dir: None,
             output_folder_name: "flattened".to_string(),
             root_name_choice: RootNameChoice::FolderName,
             custom_root_name: String::new(),
-            ignored_folders_text: "node_modules, .git, target, build, managed_components, .venv, .vscode".to_string(),
-            ignored_files_text: ".DS_Store, Thumbs.db, dependencies.lock, partitions.csv".to_string(),
+            ignored_folders_text: "node_modules, .git, target, build, .venv".to_string(),
+            ignored_files_text: ".DS_Store, Thumbs.db".to_string(),
             ignored_extensions_text: "log, tmp".to_string(),
             respect_gitignore: true,
             separator_choice: SeparatorChoice::SlashLike,
             custom_separator: String::new(),
             status: String::new(),
             last_run_errors: Vec::new(),
+            config_status: None,
+            update_rx: Some(update_rx),
+            update_state: UpdateState::Checking,
+            exit_tx,
+            exit_rx,
+        }
+    }
+
+    /// Polls the background update-check channel (non-blocking) and starts
+    /// a download-and-launch on a background thread when the user requests it.
+    fn poll_update_channel(&mut self) {
+        if let Some(rx) = &self.update_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.update_state = match result {
+                    Ok(Some(info)) => UpdateState::Available(info),
+                    Ok(None) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Error(e),
+                };
+                self.update_rx = None; // one-shot; stop polling
+            }
         }
     }
 }
@@ -156,6 +202,19 @@ fn parse_list(text: &str) -> std::collections::HashSet<String> {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Joins a set back into a comma-separated string for display in a text
+/// field. Order isn't semantically meaningful, so entries are sorted for a
+/// stable, human-friendly display.
+fn join_list(set: &std::collections::HashSet<String>) -> String {
+    let mut items: Vec<&String> = set.iter().collect();
+    items.sort();
+    items
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl FlattenizerApp {
@@ -185,10 +244,79 @@ impl FlattenizerApp {
             respect_gitignore: self.respect_gitignore,
         })
     }
+
+    /// Applies a loaded `.flattenizerrc` config onto the UI fields. Called
+    /// after picking a folder that has one.
+    fn apply_project_config(&mut self, config: &core::ProjectConfig) {
+        self.output_folder_name = config.output_folder_name.clone();
+        self.root_name_choice = match &config.root_name_mode {
+            RootNameMode::None => RootNameChoice::None,
+            RootNameMode::UseFolderName => RootNameChoice::FolderName,
+            RootNameMode::Custom(s) => {
+                self.custom_root_name = s.clone();
+                RootNameChoice::Custom
+            }
+        };
+        self.separator_choice = match &config.separator_style {
+            SeparatorStyle::SlashLike => SeparatorChoice::SlashLike,
+            SeparatorStyle::Underscore => SeparatorChoice::Underscore,
+            SeparatorStyle::Custom(s) => {
+                self.custom_separator = s.clone();
+                SeparatorChoice::Custom
+            }
+        };
+        self.ignored_folders_text = join_list(&config.ignored_folder_names);
+        self.ignored_files_text = join_list(&config.ignored_file_names);
+        self.ignored_extensions_text = join_list(&config.ignored_extensions);
+        self.respect_gitignore = config.respect_gitignore;
+    }
+
+    /// Downloads the installer and launches it on a background thread, then
+    /// flips the update banner into "Downloading…" state. The installer
+    /// takes over from there; the app should exit once the launch succeeds.
+    fn start_update(&mut self, info: update::UpdateInfo) {
+        self.update_state = UpdateState::Downloading;
+        let exit_tx = self.exit_tx.clone();
+        std::thread::spawn(move || {
+            match update::download_installer(&info) {
+                Ok(path) => match update::launch_installer(&path) {
+                    Ok(()) => {
+                        let _ = exit_tx.send(());
+                    }
+                    Err(_e) => {
+                        // Installer failed to launch; nothing further to do here
+                        // since UpdateState can't be mutated from this thread.
+                        // The user can retry via the release page link shown
+                        // in the banner if this happens.
+                    }
+                },
+                Err(_e) => {}
+            }
+        });
+    }
 }
 
 impl eframe::App for FlattenizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_update_channel();
+
+        // If the installer was launched successfully, close this app so the
+        // installer can replace the running exe without a file-lock conflict.
+        if self.exit_rx.try_recv().is_ok() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Keep repainting periodically while the update state might still
+        // change (checking/downloading), since background threads can't
+        // request a repaint on their own without holding a Context handle.
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Downloading
+        ) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
+
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -207,6 +335,54 @@ impl eframe::App for FlattenizerApp {
                 )
                 .weak(),
             );
+
+            // --- Update banner ---
+            let mut update_to_start: Option<update::UpdateInfo> = None;
+            match &self.update_state {
+                UpdateState::Available(info) => {
+                    ui.add_space(10.0);
+                    card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Update available: v{}",
+                                    info.latest_version
+                                ))
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 166, 35)),
+                            );
+                            if ui.button("Update now").clicked() {
+                                update_to_start = Some(info.clone());
+                            }
+                            ui.hyperlink_to("Release notes", &info.release_url);
+                        });
+                    });
+                }
+                UpdateState::Downloading => {
+                    ui.add_space(10.0);
+                    card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Downloading update…");
+                        });
+                    });
+                }
+                UpdateState::Error(e) => {
+                    ui.add_space(10.0);
+                    card(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Update check failed: {e}"))
+                                .small()
+                                .weak(),
+                        );
+                    });
+                }
+                UpdateState::Checking | UpdateState::UpToDate => {}
+            }
+            if let Some(info) = update_to_start {
+                self.start_update(info);
+            }
+
             ui.add_space(14.0);
 
             // --- Source folder ---
@@ -215,6 +391,19 @@ impl eframe::App for FlattenizerApp {
                 ui.horizontal(|ui| {
                     if ui.button("📁  Choose folder…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            match core::load_config(&path) {
+                                Ok(Some(config)) => {
+                                    self.apply_project_config(&config);
+                                    self.config_status =
+                                        Some(format!("Loaded {} from this folder.", core::CONFIG_FILE_NAME));
+                                }
+                                Ok(None) => {
+                                    self.config_status = None;
+                                }
+                                Err(e) => {
+                                    self.config_status = Some(format!("Couldn't load config: {e}"));
+                                }
+                            }
                             self.source_dir = Some(path);
                         }
                     }
@@ -226,6 +415,36 @@ impl eframe::App for FlattenizerApp {
                         None => ui.label(egui::RichText::new("No folder selected").weak().italics()),
                     };
                 });
+
+                if self.source_dir.is_some() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("💾  Save settings to {}", core::CONFIG_FILE_NAME))
+                            .clicked()
+                        {
+                            if let Some(opts) = self.build_options() {
+                                let config = core::ProjectConfig::from_options(&opts);
+                                match core::save_config(&opts.source_dir, &config) {
+                                    Ok(()) => {
+                                        self.config_status = Some(format!(
+                                            "Saved settings to {}.",
+                                            core::CONFIG_FILE_NAME
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.config_status = Some(format!("Couldn't save config: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if let Some(msg) = &self.config_status {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
             });
 
             ui.add_space(10.0);
